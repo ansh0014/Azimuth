@@ -1,6 +1,13 @@
 # Azimuth: Ultra-Low-Memory 6-DoF Inertial Trajectory Estimator
 
-Azimuth is a native, single-threaded, zero-heap-allocation C++17 system that estimates 6-DoF trajectory poses (`timestamp tx ty tz qx qy qz qw`) from degraded 6-axis IMU streams subject to progressive white noise, random-walk bias drift, scale factor drift, high-magnitude sensor spikes, stuck frames, burst dropouts, duplicate rows, and complete sensor blackout intervals.
+**XR Hackathon Challenge 2026 — Track 03: Path Finder**  
+**Organized by:** Samsung R&D Institute India, Bangalore  
+**Team Name:** Nexus  
+**Institution:** Thapar Institute of Engineering & Technology  
+**Team Members:** Kavish Arora • Anshul Jagota • Dhriti Dhall  
+**Presentation:** [Thapar_Nexus.pptx](Thapar_Nexus.pptx)  
+
+Azimuth is a native, single-threaded, zero-heap-allocation system (available in both high-performance C++17 and Python) that estimates 6-DoF trajectory poses (`timestamp tx ty tz qx qy qz qw`) from degraded 6-axis IMU streams subject to progressive white noise, random-walk bias drift, scale factor drift, high-magnitude sensor spikes, stuck frames, burst dropouts, duplicate rows, and complete sensor blackout intervals.
 
 ---
 
@@ -107,8 +114,11 @@ Evaluated under progressive fault injection (`SEED = 42`, white noise, bias rand
 Azimuth/
 ├── CMakeLists.txt         # C++17 build configuration (-O3 -march=native -fno-exceptions -fno-rtti -s)
 ├── README.md              # Architecture, algorithms, benchmarks, and build documentation
-├── main.cpp               # CLI entrypoint, 16 KB segmented stream buffers, RSS & latency profiler
+├── main.cpp               # C++ CLI entrypoint, 16 KB segmented stream buffers, RSS & latency profiler
 └── src/
+    ├── main.py            # Standalone Python entrypoint (Official Evaluator compliant)
+    ├── main.cpp           # C++ entrypoint copy
+    ├── CMakeLists.txt     # Build configuration
     ├── types.hpp          # Vector3d, Quaterniond, Pose6D, and IMU frame structures
     ├── parser.hpp         # Zero-heap CSV stream parser, 19-digit ns precision, format auto-detector
     ├── dsp_cleaner.hpp    # Zero-lag causal DSP cleaner: duplicate, stuck-frame, Hampel, 18 Hz Biquad
@@ -120,17 +130,24 @@ Azimuth/
 
 ## 5. Build & Execution Instructions
 
-### Prerequisites
-- CMake >= 3.16
-- C++17 Compiler (GCC / MinGW-w64, Clang, or MSVC)
+### Option A: Python Execution (Direct / Standalone)
+Requires standard Python 3.x (zero external dependencies required):
+```bash
+python src/main.py <input_imu.csv> <output_trajectory.txt> [--meta metadata.json]
+```
 
-### Compile
+### Option B: C++ Native Compilation & Execution
+Prerequisites: CMake >= 3.16, C++17 Compiler (GCC / MinGW-w64, Clang, or MSVC)
 ```bash
 cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
-```
-
-### Run Trajectory Estimator
-```bash
 ./build/pathfinder <input_imu.csv> <output_trajectory.txt> [--meta metadata.json]
 ```
+
+---
+
+## 6. AI Disclosure
+
+In accordance with the XR Hackathon Challenge 2026 transparency guidelines:
+- **AI Tool Assistance:** Generative AI tools were utilized during development for code structuring, documentation generation, syntax validation, Markdown formatting, and scaffolding test utilities.
+- **Original Engineering & Implementation:** All core algorithmic implementations—including the zero-allocation streaming parser, causal 2nd-order Butterworth biquad filter, Hampel MAD outlier rejection, adaptive-gain Madgwick attitude estimation with maneuver acceleration suppression, world-acceleration drift control, and coordinated flight arc dead-reckoning extrapolator—were designed, implemented, mathematically validated, and benchmarked by Team Nexus.
