@@ -1,0 +1,10 @@
+build/
+*.exe
+*.obj
+*.o
+*.txt
+!CMakeLists.txt
+*.json
+*.csv
+.DS_Store
+Thumbs.db
