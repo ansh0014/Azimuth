@@ -1,37 +1,34 @@
-# Azimuth: Ultra-Low-Memory 6-DoF Trajectory Estimation Under Sensor Degradation
+# Azimuth: Ultra-Low-Memory 6-DoF Inertial Trajectory Estimator
 
-**XR Hackathon 2026 — Track 03: Path Finder**
-
-Azimuth is a native, single-threaded, zero-heap-allocation C++17 system that estimates 6-DoF trajectory poses (`timestamp tx ty tz qx qy qz qw`) from severely degraded 6-axis IMU streams subject to progressive white noise, random-walk bias drift, scale factor drift, high-magnitude sensor spikes, stuck frames, burst dropouts, duplicate rows, and a 5.0-second total sensor blackout tail.
+Azimuth is a native, single-threaded, zero-heap-allocation C++17 system that estimates 6-DoF trajectory poses (`timestamp tx ty tz qx qy qz qw`) from degraded 6-axis IMU streams subject to progressive white noise, random-walk bias drift, scale factor drift, high-magnitude sensor spikes, stuck frames, burst dropouts, duplicate rows, and complete sensor blackout intervals.
 
 ---
 
-## 1. System Constraints & Compliance
+## 1. System Specifications & Measured Performance
 
-| Constraint | Hackathon Requirement | Azimuth Measured Performance | Status |
-| :--- | :--- | :--- | :--- |
-| **Language & Standard** | C++17 (`-O3 -march=native`) | C++17 (`-O3 -march=native -fno-exceptions -fno-rtti -s`) | PASS |
-| **Peak Memory (RSS)** | <= 8192 KB (8.0 MB) | **5136 KB (5.01 MB)** | PASS |
-| **Compute Speed** | <= 20.0 ms per 1 s of IMU data | **3.697 ms per 1 s of IMU data (270.5x real-time)** | PASS |
-| **Execution Model** | Strictly Single CPU Thread | Single thread (`0` thread/OpenMP/pthread symbols) | PASS |
-| **Memory Architecture** | No full-file load, no `mmap` | Segmented 16 KB stream buffers + fixed stack arrays | PASS |
-| **Row Synchronization** | Exact 1-to-1 pose per input row | **11706 in -> 11706 out** (including `dt == 0` duplicates) | PASS |
-| **Network Calls** | 100% Offline | Zero network dependencies | PASS |
+| System Metric | Architecture Specification | Measured Performance |
+| :--- | :--- | :--- |
+| **Language & Standard** | C++17 (`-O3 -march=native -fno-exceptions -fno-rtti -s`) | Zero external dependencies |
+| **Peak Memory (RSS)** | Segmented 16 KB stream buffers + fixed stack arrays | **5136 KB (5.01 MB)** |
+| **Compute Latency** | Single-pass streaming execution | **3.697 ms per 1 s of IMU data (270.5x real-time)** |
+| **Execution Model** | Single CPU thread, deterministic | Zero threading or dynamic allocation overhead |
+| **Frame Synchronization** | 1-to-1 pose output per input row | **11706 in -> 11706 out** (including `dt == 0` duplicates) |
+| **Runtime Environment** | 100% Offline | Zero network or external runtime calls |
 
 ---
 
 ## 2. Algorithmic Architecture (3-Stage Pipeline)
 
 ### Stage 0: Zero-Allocation Streaming Parser (`src/parser.hpp`)
-- **Segmented I/O:** Uses 16 KB `setvbuf` stream buffers (`char[16384]`) on standard `FILE*` descriptors without dynamic heap allocations (`std::vector` and `std::string` are completely absent).
+- **Segmented I/O:** Uses 16 KB `setvbuf` stream buffers (`char[16384]`) on standard `FILE*` descriptors without dynamic heap allocations.
 - **Format & Unit Auto-Detection:** Inspects the header and the first 40 rows using fixed stack arrays (`double[40]`) to automatically detect:
-  - **Column Order:** EuRoC order (`timestamp, wx, wy, wz, ax, ay, az`) vs. degraded order (`timestamp, ax, ay, az, gx, gy, gz`) via header tokens and median 3-axis vector norms.
+  - **Column Order:** EuRoC order (`timestamp, wx, wy, wz, ax, ay, az`) vs. accel-first order (`timestamp, ax, ay, az, gx, gy, gz`) via header tokens and median 3-axis vector norms.
   - **Timestamp Units:** Auto-detects `s`, `ms`, `us`, or `ns` from the median sampling interval `median_dt`. For 19-digit nanosecond timestamps, parses via `std::strtoll` into `int64_t` and splits integer seconds and remainder nanoseconds prior to floating-point conversion to prevent IEEE-754 precision loss.
   - **Sensor Units:** Normalizes acceleration to `m/s^2` (detecting `g` vs `m/s^2`) and angular velocity to `rad/s` (detecting `deg/s` vs `rad/s`).
 
 ### Stage 1: Causal DSP Cleaning (`src/dsp_cleaner.hpp`)
 Processes each incoming sample in a 1-in, 1-out zero-lag streaming pipeline:
-1. **Duplicate Detection (`dt == 0`):** Compares exact 64-bit nanosecond timestamps (`raw_ts_ns == last_raw_ts_ns_`). When a duplicate timestamp is encountered, the DSP filter and state integrator are bypassed, and the current pose is emitted immediately to preserve strict 1-to-1 row alignment without corrupting filter state.
+1. **Duplicate Detection (`dt == 0`):** Compares exact 64-bit nanosecond timestamps (`raw_ts_ns == last_raw_ts_ns_`). When a duplicate timestamp is encountered, the DSP filter and state integrator are bypassed, and the current pose is emitted immediately to preserve 1-to-1 row alignment without corrupting filter state.
 2. **Total Sensor Blackout Detection:** Monitors the L1 norm of all 6 sensor axes (`|ax| + |ay| + |az| + |gx| + |gy| + |gz| < 1e-9`). When 5 consecutive non-duplicate zero frames are detected, the pipeline latches into Stage 3 (Blind Dead Reckoning).
 3. **Stuck-Frame Detection & Extrapolation:** Identifies runs of `>= 2` consecutive non-duplicate frames with identical 6-axis readings (`diff < 1e-6`) and extrapolates local sample gradients so the integrator does not freeze during sensor lockups.
 4. **15-Sample Hampel Spike Rejection Filter:** Maintains a 15-sample sliding window per axis on stack memory. Computes the sample median and Median Absolute Deviation (`MAD`) via `std::nth_element`. Any sample exceeding `|x - median| > 4.0 * 1.4826 * MAD` is replaced with the window median, rejecting `6g` accelerometer and `1 rad/s` gyroscope spikes.
@@ -41,7 +38,7 @@ Processes each incoming sample in a 1-in, 1-out zero-lag streaming pipeline:
    ```
 
 ### Stage 2: 6-DoF State Estimation & Drift Control (`src/estimator.hpp`)
-1. **Initial 2.0-Second Protect Window Calibration (`protect_seconds_ = 2.0`):**
+1. **Initial 2.0-Second Stationary Calibration (`protect_seconds_ = 2.0`):**
    - Initializes roll and pitch attitude from the initial gravity vector.
    - Accumulates baseline gyroscope readings (`sum_init_gyro_`) and gravity-removed world accelerations (`sum_init_world_accel_`) across the initial stationary window to calibrate `init_gyro_bias` and `world_accel_bias_`.
 2. **Adaptive-Gain Madgwick/Mahony Attitude Filter (`NativeMadgwickAhrs`):**
@@ -58,7 +55,7 @@ Processes each incoming sample in a 1-in, 1-out zero-lag streaming pipeline:
      ```
      a_world_raw = q * a_body * q^-1 - [0, 0, 9.80665]^T
      ```
-   - Tracks and removes the random-walk accelerometer bias injected over time using an online exponential moving average with time constant `tau_bias = 4.0 s`:
+   - Tracks and removes random-walk accelerometer bias using an online exponential moving average with time constant `tau_bias = 4.0 s`:
      ```
      alpha = dt / (tau_bias + dt)
      world_accel_bias = world_accel_bias + alpha * (a_world_raw - world_accel_bias)
@@ -75,7 +72,7 @@ Processes each incoming sample in a 1-in, 1-out zero-lag streaming pipeline:
    - Maintains a 256-entry circular history buffer of recent clean velocities and angular rates for seamless Stage 3 handoff.
 
 ### Stage 3: Coordinated Flight Arc Dead Reckoning (`src/dead_reckoning.hpp`)
-- Triggered automatically when the 5.0-second total sensor blackout (`0.0` on all 6 axes) is detected.
+- Triggered automatically when a total sensor blackout (`0.0` on all 6 axes for `>= 5` consecutive frames) is detected.
 - Latches the last healthy pose `(p_0, q_0)`, the smoothed 150-sample average velocity `v_0`, and the 50-sample average angular velocity `w_0`.
 - Transforms `v_0` into the aircraft body frame (`v_body_0 = q_0^-1 * v_0 * q_0`).
 - At each blackout timestamp `t_k` (`dt_fail = t_k - t_fail_start`):
@@ -87,19 +84,20 @@ Processes each incoming sample in a 1-in, 1-out zero-lag streaming pipeline:
 
 ---
 
-## 3. Benchmark & Official Scorecard Results
+## 3. Benchmark Results
 
-Evaluated against `degrade_imu.py` (`SEED = 42`, `max_level = 1.0`, `gamma = 1.7`, `protect_seconds = 2.0`, `failure_seconds = 5.0`) across both the primary 60-second EuRoC Machine Hall profile and a harder 75-second high-maneuver `V1_02_medium` generalization sequence (with zero parameter changes):
+Evaluated under progressive fault injection (`SEED = 42`, white noise, bias random walk, scale drift, `6g` spikes, stuck runs of 2-10 samples, burst dropouts of 5-50 samples, duplicate rows, and a 5.0-second total sensor blackout tail) across both a 60-second standard flight profile and a 75-second high-maneuver generalization profile:
 
-| Evaluation Metric | Weight | Primary Sequence (60s, 11706 rows) | Generalization Sequence (75s, 14621 rows) |
-| :--- | :--- | :--- | :--- |
-| **Row Synchronization** | Gate | `11706 in -> 11706 out` (100% Match) | `14621 in -> 14621 out` (100% Match) |
-| **Peak Memory (RSS)** | 20 pts | **5136 KB** (`17.49 / 20.00 pts`) | **5132 KB** (`17.49 / 20.00 pts`) |
-| **Runtime Latency** | 20 pts | **3.697 ms/s IMU** (`20.00 / 20.00 pts`) | **2.989 ms/s IMU** (`20.00 / 20.00 pts`) |
-| **T1 Waypoint ATE (RMSE)** | 30 pts | **3.436 m** (`29.79 / 30.00 pts`) | **6.619 m** (`29.61 / 30.00 pts`) |
-| **T2 Blind 5s ATE (RMSE)** | 20 pts | **4.108 m** (`19.92 / 20.00 pts`) | **9.072 m** (`19.82 / 20.00 pts`) |
-| **T3 Dropout RPE (@ 1s)** | 10 pts | **1.683 m/s** (`9.67 / 10.00 pts`) | **3.286 m/s** (`9.36 / 10.00 pts`) |
-| **Total Competition Score** | **100 pts** | **96.87 / 100.00 pts** | **96.28 / 100.00 pts** |
+| Benchmark Metric | Sequence 1 (60s, 11706 rows) | Sequence 2 (75s High-Maneuver, 14621 rows) |
+| :--- | :--- | :--- |
+| **Pose Synchronization** | `11706 in -> 11706 out` (100% Match) | `14621 in -> 14621 out` (100% Match) |
+| **Peak Memory (RSS)** | **5136 KB (5.01 MB)** | **5132 KB (5.01 MB)** |
+| **Total Execution Time** | **221.80 ms** | **224.13 ms** |
+| **Compute Latency** | **3.697 ms/s IMU** (`270.5x` real-time) | **2.989 ms/s IMU** (`334.6x` real-time) |
+| **Active Flight ATE (RMSE)** | **3.436 m** | **6.619 m** |
+| **Blind 5s Dead-Reckoning ATE (RMSE)** | **4.108 m** | **9.072 m** |
+| **Relative Pose Error (RPE @ 1s)** | **1.683 m/s** | **3.286 m/s** |
+| **Quaternion Norm Error (`max ||q|| - 1|`)** | **6.86e-07** | **6.83e-07** |
 
 ---
 
@@ -135,16 +133,4 @@ cmake --build build --config Release
 ### Run Trajectory Estimator
 ```bash
 ./build/pathfinder <input_imu.csv> <output_trajectory.txt> [--meta metadata.json]
-```
-
-### Example End-to-End Evaluation Workflow
-```bash
-# 1. Generate degraded IMU telemetry via official fault-injection script
-python degrade_imu.py clean_imu.csv degraded_imu.csv --meta degrade_stats.json
-
-# 2. Run Azimuth PathFinder binary
-./Azimuth/build/pathfinder degraded_imu.csv Azimuth/estimated_trajectory.txt --meta Azimuth/metadata.json
-
-# 3. Compute Official 100-Point Scorecard
-python evaluate_scorecard.py groundtruth.txt Azimuth/estimated_trajectory.txt Azimuth/metadata.json degrade_stats.json evaluation_scorecard.txt
 ```
