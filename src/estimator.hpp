@@ -36,6 +36,10 @@ public:
         if (dt > 1e-5) sample_period_ = dt;
     }
 
+    void set_gyro_bias(const Vector3d& bias) {
+        gyro_bias_ = bias;
+    }
+
     Quaterniond get_quaternion() const { return q_; }
     Vector3d get_gyro_bias() const { return gyro_bias_; }
 
@@ -146,6 +150,8 @@ public:
           protect_sample_count_(0),
           in_protect_phase_(true),
           dr_active_(false),
+          tau_bias_(4.0),
+          vel_damping_(0.6),
           history_head_(0),
           history_count_(0)
     {
@@ -156,13 +162,19 @@ public:
         current_velocity_ = {0.0, 0.0, 0.0};
         last_world_accel_ = {0.0, 0.0, 0.0};
 
-        sum_init_accel_ = {0.0, 0.0, 0.0};
+        sum_init_world_accel_ = {0.0, 0.0, 0.0};
         sum_init_gyro_ = {0.0, 0.0, 0.0};
+        world_accel_bias_ = {0.0, 0.0, 0.0};
     }
 
     void init(double first_timestamp, double median_dt) {
         start_timestamp_ = first_timestamp;
         ahrs_.init(median_dt);
+    }
+
+    void set_parameters(double tau_bias, double vel_damping) {
+        tau_bias_ = tau_bias;
+        vel_damping_ = vel_damping;
     }
 
     Pose6D update(const CleanedImuSample& sample) {
@@ -187,32 +199,53 @@ public:
         Vector3d gyro = {sample.gx, sample.gy, sample.gz};
         Vector3d accel = {sample.ax, sample.ay, sample.az};
 
-        // Protect window baseline statistics
-        if (in_protect_phase_) {
-            if (elapsed < protect_seconds_) {
-                sum_init_accel_ = sum_init_accel_ + accel;
-                sum_init_gyro_ = sum_init_gyro_ + gyro;
-                protect_sample_count_++;
-            } else {
-                in_protect_phase_ = false;
-            }
-        }
-
         // AHRS attitude estimation
         ahrs_.set_sample_period(dt);
         ahrs_.update(gyro, accel);
         current_pose_.quat = ahrs_.get_quaternion();
 
-        // Gravity-removed Earth acceleration
-        Vector3d world_accel = ahrs_.extract_world_acceleration(accel);
+        // Gravity-removed Earth acceleration (raw)
+        Vector3d raw_world_accel = ahrs_.extract_world_acceleration(accel);
+        Vector3d world_accel = {0.0, 0.0, 0.0};
 
-        // Stationary launch pad clamping vs in-flight integration
+        // 1. Protect window calibration (first 2.0 seconds)
         if (in_protect_phase_) {
-            current_velocity_ = {0.0, 0.0, 0.0};
-            world_accel = {0.0, 0.0, 0.0};
-        } else {
-            // Very gentle damping to keep double integration bounded
-            current_velocity_ = current_velocity_ * std::exp(-0.001 * dt);
+            if (elapsed < protect_seconds_) {
+                sum_init_world_accel_ = sum_init_world_accel_ + raw_world_accel;
+                sum_init_gyro_ = sum_init_gyro_ + gyro;
+                protect_sample_count_++;
+                current_velocity_ = {0.0, 0.0, 0.0};
+                world_accel = {0.0, 0.0, 0.0};
+            } else {
+                in_protect_phase_ = false;
+                if (protect_sample_count_ > 0) {
+                    double inv_n = 1.0 / static_cast<double>(protect_sample_count_);
+                    Vector3d init_gyro_bias = sum_init_gyro_ * inv_n;
+                    ahrs_.set_gyro_bias(init_gyro_bias);
+                    world_accel_bias_ = sum_init_world_accel_ * inv_n;
+                }
+            }
+        }
+
+        // 2. Post-protect active flight tracking: online leaky world_accel_bias_ high-pass filter, ZUPT, damping
+        if (!in_protect_phase_) {
+            double alpha = dt / (tau_bias_ + dt);
+            world_accel_bias_ = world_accel_bias_ + (raw_world_accel - world_accel_bias_) * alpha;
+            world_accel = raw_world_accel - world_accel_bias_;
+
+            // Safety clamp: prevent any residual spike > 15.0 m/s^2 from blowing up integration
+            double wa_norm = world_accel.norm();
+            if (wa_norm > 15.0) {
+                world_accel = world_accel * (15.0 / wa_norm);
+            }
+
+            // Exponential velocity damping
+            current_velocity_ = current_velocity_ * std::exp(-vel_damping_ * dt);
+
+            // Zero-Velocity Update (ZUPT) during stationary/quasi-stationary segments
+            if (gyro.norm() < 0.08 && std::fabs(accel.norm() - GRAVITY_STANDARD) < 0.25) {
+                current_velocity_ = current_velocity_ * std::exp(-8.0 * dt);
+            }
         }
 
         // Trapezoidal integration
@@ -237,13 +270,16 @@ private:
     size_t protect_sample_count_;
     bool in_protect_phase_;
     bool dr_active_;
+    double tau_bias_;
+    double vel_damping_;
 
     Pose6D current_pose_;
     Vector3d current_velocity_;
     Vector3d last_world_accel_;
 
-    Vector3d sum_init_accel_;
+    Vector3d sum_init_world_accel_;
     Vector3d sum_init_gyro_;
+    Vector3d world_accel_bias_;
 
     struct HistoryEntry {
         double timestamp;

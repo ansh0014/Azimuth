@@ -4,6 +4,7 @@
 #include "types.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -28,7 +29,8 @@ public:
           gyro_scale_(1.0),
           median_dt_(0.005),
           last_timestamp_s_(-1.0),
-          first_timestamp_s_(-1.0)
+          first_timestamp_s_(-1.0),
+          last_raw_ts_ns_(-1)
     {
     }
 
@@ -85,6 +87,7 @@ private:
     double median_dt_;
     double last_timestamp_s_;
     double first_timestamp_s_;
+    int64_t last_raw_ts_ns_;
 
     bool read_line(char* dest, size_t max_len) {
         if (!std::fgets(dest, static_cast<int>(max_len), file_)) {
@@ -181,9 +184,13 @@ private:
         median_dt_ = raw_median_dt * ts_scale_;
         if (median_dt_ <= 0.0) median_dt_ = 0.005;
 
-        if (order_ == ImuColumnOrder::Unknown && !norm1_list.empty()) {
+        // Always sort norm lists before computing medians for order or unit scale detection
+        if (!norm1_list.empty()) {
             std::sort(norm1_list.begin(), norm1_list.end());
             std::sort(norm2_list.begin(), norm2_list.end());
+        }
+
+        if (order_ == ImuColumnOrder::Unknown && !norm1_list.empty()) {
             double med_norm1 = norm1_list[norm1_list.size() / 2];
             double med_norm2 = norm2_list[norm2_list.size() / 2];
 
@@ -249,40 +256,78 @@ private:
     }
 
     bool parse_line(char* line, RawImuSample& sample) {
-        double vals[7];
-        int count = parse_doubles(line, vals, 7);
-        if (count < 7) return false;
+        char* cur = line;
+        while (*cur == ' ' || *cur == '\t') cur++;
+        if (!*cur) return false;
 
-        sample.raw_timestamp = vals[0];
-        sample.timestamp_s = vals[0] * ts_scale_;
+        int64_t raw_ts_ns = -1;
+        double ts_sec = 0.0;
+        char* end = nullptr;
+
+        if (ts_scale_ == 1e-9) {
+            raw_ts_ns = std::strtoll(cur, &end, 10);
+            if (end == cur) return false;
+            if (*end == '.') {
+                // Fallback if formatted as float
+                ts_sec = std::strtod(cur, &end) * ts_scale_;
+                raw_ts_ns = static_cast<int64_t>(ts_sec * 1e9);
+            } else {
+                int64_t sec = raw_ts_ns / 1000000000LL;
+                int64_t nsec = raw_ts_ns % 1000000000LL;
+                ts_sec = static_cast<double>(sec) + static_cast<double>(nsec) * 1e-9;
+            }
+            sample.raw_timestamp = static_cast<double>(raw_ts_ns);
+            sample.timestamp_s = ts_sec;
+        } else {
+            double raw_ts = std::strtod(cur, &end);
+            if (end == cur) return false;
+            sample.raw_timestamp = raw_ts;
+            sample.timestamp_s = raw_ts * ts_scale_;
+        }
+
+        cur = end;
+        while (*cur == ' ' || *cur == '\t') cur++;
+        if (*cur == ',') cur++;
+
+        double vals[6];
+        int count = parse_doubles(cur, vals, 6);
+        if (count < 6) return false;
 
         if (first_timestamp_s_ < 0.0) {
             first_timestamp_s_ = sample.timestamp_s;
             last_timestamp_s_ = sample.timestamp_s;
+            last_raw_ts_ns_ = raw_ts_ns;
             sample.is_duplicate = false;
         } else {
-            if (std::fabs(sample.timestamp_s - last_timestamp_s_) < 1e-12) {
+            bool is_dup = false;
+            if (ts_scale_ == 1e-9 && raw_ts_ns >= 0 && last_raw_ts_ns_ >= 0) {
+                is_dup = (raw_ts_ns == last_raw_ts_ns_);
+            } else {
+                is_dup = (std::fabs(sample.timestamp_s - last_timestamp_s_) < 1e-12);
+            }
+            if (is_dup) {
                 sample.is_duplicate = true;
             } else {
                 sample.is_duplicate = false;
                 last_timestamp_s_ = sample.timestamp_s;
+                last_raw_ts_ns_ = raw_ts_ns;
             }
         }
 
         if (order_ == ImuColumnOrder::DegradedAccelFirst) {
-            sample.ax = vals[1] * accel_scale_;
-            sample.ay = vals[2] * accel_scale_;
-            sample.az = vals[3] * accel_scale_;
-            sample.gx = vals[4] * gyro_scale_;
-            sample.gy = vals[5] * gyro_scale_;
-            sample.gz = vals[6] * gyro_scale_;
+            sample.ax = vals[0] * accel_scale_;
+            sample.ay = vals[1] * accel_scale_;
+            sample.az = vals[2] * accel_scale_;
+            sample.gx = vals[3] * gyro_scale_;
+            sample.gy = vals[4] * gyro_scale_;
+            sample.gz = vals[5] * gyro_scale_;
         } else {
-            sample.gx = vals[1] * gyro_scale_;
-            sample.gy = vals[2] * gyro_scale_;
-            sample.gz = vals[3] * gyro_scale_;
-            sample.ax = vals[4] * accel_scale_;
-            sample.ay = vals[5] * accel_scale_;
-            sample.az = vals[6] * accel_scale_;
+            sample.gx = vals[0] * gyro_scale_;
+            sample.gy = vals[1] * gyro_scale_;
+            sample.gz = vals[2] * gyro_scale_;
+            sample.ax = vals[3] * accel_scale_;
+            sample.ay = vals[4] * accel_scale_;
+            sample.az = vals[5] * accel_scale_;
         }
         return true;
     }
