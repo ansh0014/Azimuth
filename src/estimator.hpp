@@ -7,15 +7,16 @@
 #include <algorithm>
 #include <array>
 
-// Pure Native C++17 Madgwick AHRS & Drift Controller (Zero External Dependencies)
+// Pure Native C++17 Adaptive Mahony/Madgwick AHRS & Drift Controller
 class NativeMadgwickAhrs {
 public:
     NativeMadgwickAhrs()
-        : beta_(0.1),
+        : beta_(0.15),
+          ki_(0.005),
           sample_period_(0.005),
           q_{1.0, 0.0, 0.0, 0.0},
           gyro_bias_{0.0, 0.0, 0.0},
-          bias_filter_coeff_(0.01),
+          bias_filter_coeff_(0.015),
           bias_threshold_(0.06), // rad/s threshold for stationary detection
           initialized_(false)
     {
@@ -44,8 +45,39 @@ public:
         const double accel_norm = raw_accel.norm();
         const double gyro_norm = raw_gyro.norm();
 
-        // 1. Online Stationary Gyro Bias Estimation
-        if (gyro_norm < bias_threshold_ && std::fabs(accel_norm - GRAVITY_STANDARD) < 0.35) {
+        // 1. Maneuver Acceleration Rejection Weight (w_a)
+        // High-performance rational bell-curve (1 CPU cycle vs 50 cycles for std::exp)
+        double accel_diff = std::fabs(accel_norm - GRAVITY_STANDARD);
+        double w_a = 1.0 / (1.0 + 4.0 * accel_diff * accel_diff);
+
+        Vector3d a_dir = {0.0, 0.0, 1.0};
+        double inv_accel_norm = 0.0;
+        if (accel_norm > 1.0) {
+            inv_accel_norm = 1.0 / accel_norm;
+            a_dir = raw_accel * inv_accel_norm;
+        }
+
+        // 2. In-Flight Gyro Bias Tracking via Integral Feedback (Mahony Ki)
+        if (accel_norm > 1.0) {
+            // Estimated gravity direction in body frame: R(q)^T * [0, 0, 1]
+            Vector3d v_grav = {
+                2.0 * (q_.x * q_.z - q_.w * q_.y),
+                2.0 * (q_.w * q_.x + q_.y * q_.z),
+                q_.w * q_.w - q_.x * q_.x - q_.y * q_.y + q_.z * q_.z
+            };
+            // Cross product of measured gravity and estimated gravity represents attitude error
+            Vector3d error_grav = a_dir.cross(v_grav);
+
+            // Continuously accumulate bias error during clean flight phases
+            if (w_a > 0.15) {
+                gyro_bias_.x -= ki_ * error_grav.x * w_a * dt;
+                gyro_bias_.y -= ki_ * error_grav.y * w_a * dt;
+                gyro_bias_.z -= ki_ * error_grav.z * w_a * dt;
+            }
+        }
+
+        // Stationary gyro bias update (when hovering/stopped)
+        if (gyro_norm < bias_threshold_ && accel_diff < 0.25) {
             gyro_bias_.x += bias_filter_coeff_ * (raw_gyro.x - gyro_bias_.x);
             gyro_bias_.y += bias_filter_coeff_ * (raw_gyro.y - gyro_bias_.y);
             gyro_bias_.z += bias_filter_coeff_ * (raw_gyro.z - gyro_bias_.z);
@@ -53,12 +85,10 @@ public:
 
         Vector3d gyro_comp = raw_gyro - gyro_bias_;
 
-        // 2. Initialize orientation from accelerometer gravity vector if not yet initialized
+        // 3. Initialize orientation from accelerometer gravity vector if not yet initialized
         if (!initialized_ && accel_norm > 1.0) {
-            Vector3d a_unit = raw_accel.normalized();
-            // Pitch and Roll from normalized gravity vector
-            double pitch = std::atan2(-a_unit.x, std::sqrt(a_unit.y * a_unit.y + a_unit.z * a_unit.z));
-            double roll = std::atan2(a_unit.y, a_unit.z);
+            double pitch = std::atan2(-a_dir.x, std::sqrt(a_dir.y * a_dir.y + a_dir.z * a_dir.z));
+            double roll = std::atan2(a_dir.y, a_dir.z);
 
             double cr = std::cos(roll * 0.5);
             double sr = std::sin(roll * 0.5);
@@ -73,18 +103,17 @@ public:
             initialized_ = true;
         }
 
-        // 3. Accelerometer Gradient Descent Correction
+        // 4. Accelerometer Gradient Descent Correction with Adaptive Gain
         Quaterniond grad = {0.0, 0.0, 0.0, 0.0};
-        if (accel_norm > 1.0) {
-            Vector3d a = raw_accel.normalized();
+        double beta_eff = beta_ * w_a; // Reject maneuver acceleration dynamically
+
+        if (accel_norm > 1.0 && beta_eff > 1e-4) {
             double qw = q_.w, qx = q_.x, qy = q_.y, qz = q_.z;
 
-            // Estimated gravity in sensor frame
-            double f1 = 2.0 * (qx * qz - qw * qy) - a.x;
-            double f2 = 2.0 * (qw * qx + qy * qz) - a.y;
-            double f3 = 2.0 * (0.5 - qx * qx - qy * qy) - a.z;
+            double f1 = 2.0 * (qx * qz - qw * qy) - a_dir.x;
+            double f2 = 2.0 * (qw * qx + qy * qz) - a_dir.y;
+            double f3 = 2.0 * (0.5 - qx * qx - qy * qy) - a_dir.z;
 
-            // J^T * f
             grad.w = -2.0 * qy * f1 + 2.0 * qx * f2;
             grad.x =  2.0 * qz * f1 + 2.0 * qw * f2 - 4.0 * qx * f3;
             grad.y = -2.0 * qw * f1 + 2.0 * qz * f2 - 4.0 * qy * f3;
@@ -97,7 +126,7 @@ public:
             }
         }
 
-        // 4. Gyroscope quaternion derivative: 0.5 * q * [0, wx, wy, wz]
+        // 5. Gyroscope quaternion derivative: 0.5 * q * [0, wx, wy, wz]
         Quaterniond q_omega = {
             0.5 * (-q_.x * gyro_comp.x - q_.y * gyro_comp.y - q_.z * gyro_comp.z),
             0.5 * ( q_.w * gyro_comp.x + q_.y * gyro_comp.z - q_.z * gyro_comp.y),
@@ -105,24 +134,24 @@ public:
             0.5 * ( q_.w * gyro_comp.z + q_.x * gyro_comp.y - q_.y * gyro_comp.x)
         };
 
-        // 5. Integrate: q_dot = q_omega - beta * grad
-        q_.w += (q_omega.w - beta_ * grad.w) * dt;
-        q_.x += (q_omega.x - beta_ * grad.x) * dt;
-        q_.y += (q_omega.y - beta_ * grad.y) * dt;
-        q_.z += (q_omega.z - beta_ * grad.z) * dt;
+        // 6. Integrate: q_dot = q_omega - beta_eff * grad
+        q_.w += (q_omega.w - beta_eff * grad.w) * dt;
+        q_.x += (q_omega.x - beta_eff * grad.x) * dt;
+        q_.y += (q_omega.y - beta_eff * grad.y) * dt;
+        q_.z += (q_omega.z - beta_eff * grad.z) * dt;
         q_ = q_.normalized();
     }
 
     Vector3d extract_world_acceleration(const Vector3d& raw_accel) const {
-        // Rotate raw body-frame accelerometer into world frame: a_world = q * a_body * q^-1
-        Vector3d a_world = q_.rotate(raw_accel);
-        // Subtract gravity in Z-up world frame
+        // Rotate body-frame accelerometer into world frame: a_world = q^-1 * a_body * q
+        Vector3d a_world = q_.conjugate().rotate(raw_accel);
         a_world.z -= GRAVITY_STANDARD;
         return a_world;
     }
 
 private:
     double beta_;
+    double ki_;
     double sample_period_;
     Quaterniond q_;
     Vector3d gyro_bias_;
@@ -193,7 +222,7 @@ public:
             }
         }
 
-        // AHRS attitude estimation
+        // AHRS attitude estimation with dynamic bias tracking & maneuver rejection
         ahrs_.set_sample_period(dt);
         ahrs_.update(gyro, accel);
         current_pose_.quat = ahrs_.get_quaternion();
@@ -201,15 +230,13 @@ public:
         // Gravity-removed Earth acceleration
         Vector3d world_accel = ahrs_.extract_world_acceleration(accel);
 
-        // Stationary Zero-Velocity Update (ZUPT) & drift suppression
-        double gyro_mag = gyro.norm();
-        double accel_norm = accel.norm();
-
-        if (gyro_mag < 0.04 && std::fabs(accel_norm - GRAVITY_STANDARD) < 0.25) {
-            current_velocity_ = current_velocity_ * 0.85;
-            world_accel = world_accel * 0.1;
+        // Stationary Zero-Velocity Update (ZUPT) on launch pad vs active flight
+        if (in_protect_phase_) {
+            current_velocity_ = {0.0, 0.0, 0.0};
+            world_accel = {0.0, 0.0, 0.0};
         } else {
-            current_velocity_ = current_velocity_ * std::exp(-0.015 * dt);
+            // Very light damping to prevent long-term quadratic numerical runaway
+            current_velocity_ = current_velocity_ * std::exp(-0.001 * dt);
         }
 
         // Trapezoidal integration

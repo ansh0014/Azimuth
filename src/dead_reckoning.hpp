@@ -5,14 +5,15 @@
 #include <cmath>
 #include <algorithm>
 
+// Coordinated Flight Arc & Aerodynamic Dead Reckoning Extrapolator
 class DeadReckoningExtrapolator {
 public:
     DeadReckoningExtrapolator()
         : initialized_(false),
           failure_start_ts_(0.0),
           last_ts_(0.0),
-          lambda_v_(0.12),
-          lambda_w_(0.15)
+          lambda_v_(0.08),  // Aerodynamic drag decay
+          lambda_w_(0.12)   // Rotational angular damping
     {
     }
 
@@ -20,9 +21,12 @@ public:
         failure_start_ts_ = failure_start_ts;
         last_ts_ = failure_start_ts;
         current_pose_ = last_pose;
-        initial_v_ = clean_v;
         initial_w_ = clean_w;
-        current_v_ = clean_v;
+        current_v_world_ = clean_v;
+
+        // Transform initial velocity into body coordinates: v_body = q^-1 * v_world
+        v_body_0_ = last_pose.quat.conjugate().rotate(clean_v);
+
         initialized_ = true;
     }
 
@@ -40,14 +44,7 @@ public:
         double dt_fail = current_ts - failure_start_ts_;
         if (dt_fail < 0.0) dt_fail = 0.0;
 
-        // Damped velocity: v(t) = v0 * exp(-lambda_v * dt_fail)
-        Vector3d next_v = initial_v_ * std::exp(-lambda_v_ * dt_fail);
-
-        // Trapezoidal integration: p = p + 0.5 * (v_curr + next_v) * dt
-        current_pose_.pos = current_pose_.pos + (current_v_ + next_v) * (0.5 * dt);
-        current_v_ = next_v;
-
-        // Damped angular velocity: w(t) = w0 * exp(-lambda_w * dt_fail)
+        // 1. Damped angular velocity: w(t) = w0 * exp(-lambda_w * dt_fail)
         Vector3d w = initial_w_ * std::exp(-lambda_w_ * dt_fail);
         double w_norm = w.norm();
 
@@ -59,6 +56,15 @@ public:
             current_pose_.quat = (current_pose_.quat * delta_q).normalized();
         }
 
+        // 2. Coordinated Turn: Project velocity along the evolving aircraft body heading
+        double speed_decay = std::exp(-lambda_v_ * dt_fail);
+        Vector3d v_body_t = v_body_0_ * speed_decay;
+        Vector3d next_v_world = current_pose_.quat.rotate(v_body_t);
+
+        // 3. Trapezoidal position integration along the flight curve
+        current_pose_.pos = current_pose_.pos + (current_v_world_ + next_v_world) * (0.5 * dt);
+        current_v_world_ = next_v_world;
+
         current_pose_.timestamp = current_ts;
         last_ts_ = current_ts;
         return current_pose_;
@@ -69,9 +75,9 @@ private:
     double failure_start_ts_;
     double last_ts_;
     Pose6D current_pose_;
-    Vector3d initial_v_;
     Vector3d initial_w_;
-    Vector3d current_v_;
+    Vector3d v_body_0_;
+    Vector3d current_v_world_;
     double lambda_v_;
     double lambda_w_;
 };
