@@ -11,13 +11,12 @@
 class NativeMadgwickAhrs {
 public:
     NativeMadgwickAhrs()
-        : beta_(0.15),
-          ki_(0.005),
+        : beta_(0.12),
           sample_period_(0.005),
           q_{1.0, 0.0, 0.0, 0.0},
           gyro_bias_{0.0, 0.0, 0.0},
-          bias_filter_coeff_(0.015),
-          bias_threshold_(0.06), // rad/s threshold for stationary detection
+          bias_filter_coeff_(0.01),
+          bias_threshold_(0.06),
           initialized_(false)
     {
     }
@@ -46,38 +45,16 @@ public:
         const double gyro_norm = raw_gyro.norm();
 
         // 1. Maneuver Acceleration Rejection Weight (w_a)
-        // High-performance rational bell-curve (1 CPU cycle vs 50 cycles for std::exp)
         double accel_diff = std::fabs(accel_norm - GRAVITY_STANDARD);
         double w_a = 1.0 / (1.0 + 4.0 * accel_diff * accel_diff);
 
         Vector3d a_dir = {0.0, 0.0, 1.0};
-        double inv_accel_norm = 0.0;
         if (accel_norm > 1.0) {
-            inv_accel_norm = 1.0 / accel_norm;
-            a_dir = raw_accel * inv_accel_norm;
+            a_dir = raw_accel * (1.0 / accel_norm);
         }
 
-        // 2. In-Flight Gyro Bias Tracking via Integral Feedback (Mahony Ki)
-        if (accel_norm > 1.0) {
-            // Estimated gravity direction in body frame: R(q)^T * [0, 0, 1]
-            Vector3d v_grav = {
-                2.0 * (q_.x * q_.z - q_.w * q_.y),
-                2.0 * (q_.w * q_.x + q_.y * q_.z),
-                q_.w * q_.w - q_.x * q_.x - q_.y * q_.y + q_.z * q_.z
-            };
-            // Cross product of measured gravity and estimated gravity represents attitude error
-            Vector3d error_grav = a_dir.cross(v_grav);
-
-            // Continuously accumulate bias error during clean flight phases
-            if (w_a > 0.15) {
-                gyro_bias_.x -= ki_ * error_grav.x * w_a * dt;
-                gyro_bias_.y -= ki_ * error_grav.y * w_a * dt;
-                gyro_bias_.z -= ki_ * error_grav.z * w_a * dt;
-            }
-        }
-
-        // Stationary gyro bias update (when hovering/stopped)
-        if (gyro_norm < bias_threshold_ && accel_diff < 0.25) {
+        // 2. Stationary / Quasi-static Gyro Bias Estimation
+        if (gyro_norm < bias_threshold_ && accel_diff < 0.20) {
             gyro_bias_.x += bias_filter_coeff_ * (raw_gyro.x - gyro_bias_.x);
             gyro_bias_.y += bias_filter_coeff_ * (raw_gyro.y - gyro_bias_.y);
             gyro_bias_.z += bias_filter_coeff_ * (raw_gyro.z - gyro_bias_.z);
@@ -85,7 +62,7 @@ public:
 
         Vector3d gyro_comp = raw_gyro - gyro_bias_;
 
-        // 3. Initialize orientation from accelerometer gravity vector if not yet initialized
+        // 3. Initialize orientation from accelerometer gravity vector
         if (!initialized_ && accel_norm > 1.0) {
             double pitch = std::atan2(-a_dir.x, std::sqrt(a_dir.y * a_dir.y + a_dir.z * a_dir.z));
             double roll = std::atan2(a_dir.y, a_dir.z);
@@ -105,7 +82,7 @@ public:
 
         // 4. Accelerometer Gradient Descent Correction with Adaptive Gain
         Quaterniond grad = {0.0, 0.0, 0.0, 0.0};
-        double beta_eff = beta_ * w_a; // Reject maneuver acceleration dynamically
+        double beta_eff = beta_ * w_a;
 
         if (accel_norm > 1.0 && beta_eff > 1e-4) {
             double qw = q_.w, qx = q_.x, qy = q_.y, qz = q_.z;
@@ -143,15 +120,14 @@ public:
     }
 
     Vector3d extract_world_acceleration(const Vector3d& raw_accel) const {
-        // Rotate body-frame accelerometer into world frame: a_world = q^-1 * a_body * q
-        Vector3d a_world = q_.conjugate().rotate(raw_accel);
+        // q_ maps body vector to world: a_world = q * a_body * q^-1
+        Vector3d a_world = q_.rotate(raw_accel);
         a_world.z -= GRAVITY_STANDARD;
         return a_world;
     }
 
 private:
     double beta_;
-    double ki_;
     double sample_period_;
     Quaterniond q_;
     Vector3d gyro_bias_;
@@ -222,7 +198,7 @@ public:
             }
         }
 
-        // AHRS attitude estimation with dynamic bias tracking & maneuver rejection
+        // AHRS attitude estimation
         ahrs_.set_sample_period(dt);
         ahrs_.update(gyro, accel);
         current_pose_.quat = ahrs_.get_quaternion();
@@ -230,12 +206,12 @@ public:
         // Gravity-removed Earth acceleration
         Vector3d world_accel = ahrs_.extract_world_acceleration(accel);
 
-        // Stationary Zero-Velocity Update (ZUPT) on launch pad vs active flight
+        // Stationary launch pad clamping vs in-flight integration
         if (in_protect_phase_) {
             current_velocity_ = {0.0, 0.0, 0.0};
             world_accel = {0.0, 0.0, 0.0};
         } else {
-            // Very light damping to prevent long-term quadratic numerical runaway
+            // Very gentle damping to keep double integration bounded
             current_velocity_ = current_velocity_ * std::exp(-0.001 * dt);
         }
 
@@ -246,7 +222,7 @@ public:
         last_world_accel_ = world_accel;
         current_pose_.timestamp = sample.timestamp_s;
 
-        // Rolling 1.0s history for dead reckoning handoff
+        // Rolling history for dead reckoning handoff
         push_history(sample.timestamp_s, current_velocity_, gyro);
 
         return current_pose_;

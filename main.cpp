@@ -75,7 +75,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Fixed 64 KB segmented output buffer
+    // 64 KB segmented output buffer
     char out_buffer[65536];
     std::setvbuf(out_file, out_buffer, _IOFBF, sizeof(out_buffer));
 
@@ -99,13 +99,11 @@ int main(int argc, char* argv[]) {
     last_pose.quat = {1.0, 0.0, 0.0, 0.0};
 
     RawImuSample raw_sample;
-    CleanedImuSample cleaned_sample;
 
+    // 1-in-1-out streaming pipeline (zero frame lag, perfect chronological order)
     while (parser.read_sample(raw_sample)) {
         rows_in++;
-        if (first_ts < 0.0) {
-            first_ts = raw_sample.timestamp_s;
-        }
+        if (first_ts < 0.0) first_ts = raw_sample.timestamp_s;
         last_ts = raw_sample.timestamp_s;
 
         // Duplicate handling (dt == 0): emit immediately to guarantee 1-to-1 mapping
@@ -115,24 +113,10 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Push into DSP cleaner ring buffer
-        if (cleaner.push_sample(raw_sample)) {
-            while (cleaner.pop_cleaned(cleaned_sample)) {
-                last_pose = estimator.update(cleaned_sample);
-                emit_pose(out_file, cleaned_sample.timestamp_s, last_pose);
-                rows_out++;
-                break;
-            }
-        }
-    }
-
-    // Flush remaining frames in ring buffer
-    while (cleaner.has_pending()) {
-        if (cleaner.pop_cleaned(cleaned_sample)) {
-            last_pose = estimator.update(cleaned_sample);
-            emit_pose(out_file, cleaned_sample.timestamp_s, last_pose);
-            rows_out++;
-        }
+        CleanedImuSample cleaned = cleaner.clean_sample(raw_sample);
+        last_pose = estimator.update(cleaned);
+        emit_pose(out_file, cleaned.timestamp_s, last_pose);
+        rows_out++;
     }
 
     std::fflush(out_file);
