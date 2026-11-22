@@ -8,8 +8,6 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <vector>
-#include <string>
 #include <cctype>
 
 enum class ImuColumnOrder {
@@ -78,7 +76,7 @@ public:
 
 private:
     FILE* file_;
-    char io_buffer_[65536];
+    char io_buffer_[16384];
     bool has_header_;
     ImuColumnOrder order_;
     double ts_scale_;
@@ -106,15 +104,17 @@ private:
         if (!fp) return false;
 
         char line[512];
-        std::vector<double> sample_ts;
-        std::vector<double> sample_diffs;
-        std::vector<double> norm1_list;
-        std::vector<double> norm2_list;
+        double sample_ts[40];
+        double sample_diffs[40];
+        double norm1_list[40];
+        double norm2_list[40];
+        size_t n_samples = 0;
+        size_t n_diffs = 0;
 
         bool header_checked = false;
         order_ = ImuColumnOrder::Unknown;
 
-        while (std::fgets(line, sizeof(line), fp) && sample_ts.size() < 40) {
+        while (std::fgets(line, sizeof(line), fp) && n_samples < 40) {
             size_t len = std::strlen(line);
             while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) {
                 line[len - 1] = '\0';
@@ -126,17 +126,20 @@ private:
                 header_checked = true;
                 if (line[0] == '#' || !std::isdigit(static_cast<unsigned char>(line[0]))) {
                     has_header_ = true;
-                    std::string header_str(line);
-                    std::transform(header_str.begin(), header_str.end(), header_str.begin(), [](unsigned char c) {
-                        return static_cast<char>(std::tolower(c));
-                    });
-                    size_t w_pos = header_str.find("w_");
-                    if (w_pos == std::string::npos) w_pos = header_str.find("gyro");
-                    size_t a_pos = header_str.find("a_");
-                    if (a_pos == std::string::npos) a_pos = header_str.find("acc");
+                    char header_buf[512];
+                    size_t copy_len = (len < sizeof(header_buf) - 1) ? len : (sizeof(header_buf) - 1);
+                    for (size_t i = 0; i < copy_len; ++i) {
+                        header_buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(line[i])));
+                    }
+                    header_buf[copy_len] = '\0';
 
-                    if (w_pos != std::string::npos && a_pos != std::string::npos) {
-                        if (w_pos < a_pos) {
+                    const char* w_ptr = std::strstr(header_buf, "w_");
+                    if (!w_ptr) w_ptr = std::strstr(header_buf, "gyro");
+                    const char* a_ptr = std::strstr(header_buf, "a_");
+                    if (!a_ptr) a_ptr = std::strstr(header_buf, "acc");
+
+                    if (w_ptr && a_ptr) {
+                        if (w_ptr < a_ptr) {
                             order_ = ImuColumnOrder::EurocGyroFirst;
                         } else {
                             order_ = ImuColumnOrder::DegradedAccelFirst;
@@ -149,27 +152,26 @@ private:
             double vals[7];
             int count = parse_doubles(line, vals, 7);
             if (count >= 7) {
-                sample_ts.push_back(vals[0]);
-                if (sample_ts.size() > 1) {
-                    double dt = sample_ts.back() - sample_ts[sample_ts.size() - 2];
+                sample_ts[n_samples] = vals[0];
+                if (n_samples > 0) {
+                    double dt = sample_ts[n_samples] - sample_ts[n_samples - 1];
                     if (dt > 0.0) {
-                        sample_diffs.push_back(dt);
+                        sample_diffs[n_diffs++] = dt;
                     }
                 }
-                double norm1 = std::sqrt(vals[1]*vals[1] + vals[2]*vals[2] + vals[3]*vals[3]);
-                double norm2 = std::sqrt(vals[4]*vals[4] + vals[5]*vals[5] + vals[6]*vals[6]);
-                norm1_list.push_back(norm1);
-                norm2_list.push_back(norm2);
+                norm1_list[n_samples] = std::sqrt(vals[1]*vals[1] + vals[2]*vals[2] + vals[3]*vals[3]);
+                norm2_list[n_samples] = std::sqrt(vals[4]*vals[4] + vals[5]*vals[5] + vals[6]*vals[6]);
+                n_samples++;
             }
         }
         std::fclose(fp);
 
-        if (sample_ts.empty()) return false;
+        if (n_samples == 0) return false;
 
         double raw_median_dt = 1.0;
-        if (!sample_diffs.empty()) {
-            std::sort(sample_diffs.begin(), sample_diffs.end());
-            raw_median_dt = sample_diffs[sample_diffs.size() / 2];
+        if (n_diffs > 0) {
+            std::sort(sample_diffs, sample_diffs + n_diffs);
+            raw_median_dt = sample_diffs[n_diffs / 2];
         }
 
         if (raw_median_dt < 1.0) {
@@ -185,15 +187,13 @@ private:
         if (median_dt_ <= 0.0) median_dt_ = 0.005;
 
         // Always sort norm lists before computing medians for order or unit scale detection
-        if (!norm1_list.empty()) {
-            std::sort(norm1_list.begin(), norm1_list.end());
-            std::sort(norm2_list.begin(), norm2_list.end());
-        }
+        std::sort(norm1_list, norm1_list + n_samples);
+        std::sort(norm2_list, norm2_list + n_samples);
 
-        if (order_ == ImuColumnOrder::Unknown && !norm1_list.empty()) {
-            double med_norm1 = norm1_list[norm1_list.size() / 2];
-            double med_norm2 = norm2_list[norm2_list.size() / 2];
+        double med_norm1 = norm1_list[n_samples / 2];
+        double med_norm2 = norm2_list[n_samples / 2];
 
+        if (order_ == ImuColumnOrder::Unknown) {
             bool norm1_is_accel = (med_norm1 > 5.0 && med_norm1 < 20.0) || (med_norm1 > 0.5 && med_norm1 < 2.0);
             bool norm2_is_accel = (med_norm2 > 5.0 && med_norm2 < 20.0) || (med_norm2 > 0.5 && med_norm2 < 2.0);
 
@@ -211,20 +211,14 @@ private:
             order_ = ImuColumnOrder::DegradedAccelFirst;
         }
 
-        double accel_norm = GRAVITY_STANDARD;
-        if (!norm1_list.empty()) {
-            accel_norm = (order_ == ImuColumnOrder::DegradedAccelFirst) ? norm1_list[norm1_list.size() / 2] : norm2_list[norm2_list.size() / 2];
-        }
+        double accel_norm = (order_ == ImuColumnOrder::DegradedAccelFirst) ? med_norm1 : med_norm2;
         if (accel_norm > 0.5 && accel_norm < 2.0) {
             accel_scale_ = GRAVITY_STANDARD; // g to m/s^2
         } else {
             accel_scale_ = 1.0;
         }
 
-        double gyro_norm = 0.05;
-        if (!norm1_list.empty()) {
-            gyro_norm = (order_ == ImuColumnOrder::DegradedAccelFirst) ? norm2_list[norm2_list.size() / 2] : norm1_list[norm1_list.size() / 2];
-        }
+        double gyro_norm = (order_ == ImuColumnOrder::DegradedAccelFirst) ? med_norm2 : med_norm1;
         if (gyro_norm > 10.0) {
             gyro_scale_ = M_PI / 180.0; // deg/s to rad/s
         } else {
@@ -268,7 +262,6 @@ private:
             raw_ts_ns = std::strtoll(cur, &end, 10);
             if (end == cur) return false;
             if (*end == '.') {
-                // Fallback if formatted as float
                 ts_sec = std::strtod(cur, &end) * ts_scale_;
                 raw_ts_ns = static_cast<int64_t>(ts_sec * 1e9);
             } else {

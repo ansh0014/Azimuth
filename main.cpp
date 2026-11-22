@@ -2,11 +2,9 @@
 #include "src/dsp_cleaner.hpp"
 #include "src/estimator.hpp"
 
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -14,7 +12,21 @@
 #include <psapi.h>
 #else
 #include <sys/resource.h>
+#include <time.h>
 #endif
+
+static double get_time_ms() {
+#if defined(_WIN32)
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (static_cast<double>(counter.QuadPart) * 1000.0) / static_cast<double>(freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) * 1000.0 + static_cast<double>(ts.tv_nsec) * 1e-6;
+#endif
+}
 
 static size_t get_peak_rss_kb() {
 #if defined(_WIN32)
@@ -61,7 +73,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+    double start_time_ms = get_time_ms();
 
     FastCsvParser parser;
     if (!parser.open(input_path)) {
@@ -75,8 +87,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 64 KB segmented output buffer
-    char out_buffer[65536];
+    // 16 KB segmented output buffer
+    char out_buffer[16384];
     std::setvbuf(out_file, out_buffer, _IOFBF, sizeof(out_buffer));
 
     // TUM format header
@@ -123,8 +135,7 @@ int main(int argc, char* argv[]) {
     std::fclose(out_file);
     parser.close();
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double total_runtime_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    double total_runtime_ms = get_time_ms() - start_time_ms;
     double duration_s = (last_ts > first_ts && first_ts >= 0.0) ? (last_ts - first_ts) : 1.0;
     double ms_per_sec_imu = (duration_s > 0.0) ? (total_runtime_ms / duration_s) : 0.0;
     size_t peak_rss_kb = get_peak_rss_kb();

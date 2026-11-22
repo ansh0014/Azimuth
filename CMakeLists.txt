@@ -5,9 +5,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (MSVC)
-    add_compile_options(/O2 /arch:AVX2 /W4)
+    add_compile_options(/O2 /arch:AVX2 /W4 /GR-)
 else()
-    add_compile_options(-O3 -march=native -Wall -Wextra -Wpedantic)
+    add_compile_options(-O3 -march=native -Wall -Wextra -Wpedantic -fno-exceptions -fno-rtti)
+    add_link_options(-s -Wl,--as-needed)
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)

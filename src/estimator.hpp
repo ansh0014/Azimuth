@@ -5,7 +5,6 @@
 #include "dead_reckoning.hpp"
 #include <cmath>
 #include <algorithm>
-#include <array>
 
 // Pure Native C++17 Adaptive Mahony/Madgwick AHRS & Drift Controller
 class NativeMadgwickAhrs {
@@ -286,7 +285,7 @@ private:
         Vector3d velocity;
         Vector3d angular_velocity;
     };
-    std::array<HistoryEntry, HISTORY_CAPACITY> history_;
+    HistoryEntry history_[HISTORY_CAPACITY];
     size_t history_head_;
     size_t history_count_;
 
